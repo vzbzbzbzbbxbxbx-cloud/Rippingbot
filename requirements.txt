@@ -1,0 +1,8 @@
+# bot/requirements.txt
+
+# Telegram bot framework (async, v20+)
+python-telegram-bot==20.7
+
+# Optional but used for CPU/RAM monitoring in management.py
+psutil==5.9.8
+pymongo==4.7.1
