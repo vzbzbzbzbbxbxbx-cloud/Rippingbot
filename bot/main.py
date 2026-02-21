@@ -2,16 +2,16 @@
 
 import asyncio
 import logging
-from datetime import time as dt_time
-from typing import Dict, Any, Optional, List
+from datetime import time as dt_time, datetime
+from typing import Dict, Any, List
 
 from zoneinfo import ZoneInfo
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     ContextTypes,
 )
 
@@ -35,18 +35,7 @@ from .limits import (
     remaining_time,
     reset_daily_usage,
 )
-from .buttons import (
-    generate_quality_buttons,
-    generate_audio_buttons,
-    generate_stop_info_buttons,
-    parse_quality_callback,
-    parse_audio_callback,
-    parse_stop_info_callback,
-)
-from .utils.probe import probe_stream
-from .utils.ffmpeg_runner import start_recording, stop_recording
-from .utils.uploader import upload_parts_to_mega
-
+from .utils.chunk_pipeline import start_chunked_pipeline, request_stop
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +46,7 @@ logger = logging.getLogger(__name__)
 # Per-user theme ("hot" / "cold" / "dark")
 user_themes: Dict[int, str] = {}
 
-# Active recording sessions (high-level tracking; ffmpeg_runner has its own registry)
+# Active recording sessions
 # user_id -> session info dict
 active_recordings: Dict[int, Dict[str, Any]] = {}
 
@@ -82,34 +71,6 @@ def get_theme(user_id: int) -> ui.BaseTheme:
     return ui.get_theme(get_theme_name(user_id))
 
 
-def parse_duration_str(s: str) -> Optional[int]:
-    """
-    Parse a duration parameter:
-    - "3600"          -> 3600
-    - "01:00:00"      -> 3600
-    - "00:00:00" or "0" -> None (unlimited)
-    Returns seconds or None for unlimited.
-    """
-    s = s.strip()
-    if ":" in s:
-        parts = s.split(":")
-        if len(parts) != 3:
-            return None
-        try:
-            h, m, sec = map(int, parts)
-        except ValueError:
-            return None
-        total = h * 3600 + m * 60 + sec
-    else:
-        if not s.isdigit():
-            return None
-        total = int(s)
-
-    if total <= 0:
-        return None
-    return total
-
-
 def human_duration(seconds: float) -> str:
     s = int(seconds)
     h = s // 3600
@@ -122,7 +83,6 @@ def build_disk_info() -> Dict[str, Any]:
     """
     Dummy/simple disk info; you can replace with shutil.disk_usage if you want.
     """
-    # For now, we just pretend. You can import shutil and compute real numbers.
     return {
         "total_gb": 500,
         "free_gb": 420,
@@ -139,24 +99,28 @@ def build_net_info() -> Dict[str, Any]:
     }
 
 
-def summarize_active_recordings(user_id: int) -> List[Dict[str, Any]]:
+def summarize_active_recordings() -> List[Dict[str, Any]]:
     """
     Build rec_list for ui.status_display.
     """
-    recs = []
+    recs: List[Dict[str, Any]] = []
     i = 0
+    now = datetime.utcnow()
     for uid, info in active_recordings.items():
         i += 1
-        elapsed = info.get("elapsed", 0.0)
-        percent = info.get("percent", None)
+        started_at = info.get("start_time")
+        if isinstance(started_at, datetime):
+            elapsed = (now - started_at).total_seconds()
+        else:
+            elapsed = 0.0
         recs.append(
             {
                 "id": i,
                 "name": info.get("filename_base", f"user_{uid}"),
-                "quality": info.get("quality_label", "N/A"),
-                "bitrate_mbps": info.get("bitrate_mbps", None),
+                "quality": "chunked",   # fixed label for our 600MB chunk mode
+                "bitrate_mbps": None,
                 "elapsed_str": human_duration(elapsed),
-                "percent": percent,
+                "percent": None,
             }
         )
     return recs
@@ -207,7 +171,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     theme = get_theme(user.id)
     role = get_role(user.id)
 
-    rec_list = summarize_active_recordings(user.id)
+    rec_list = summarize_active_recordings()
 
     rem_secs = remaining_time(user.id, role)
     role_hours = LIMITS.get(role, {}).get("hours")
@@ -216,7 +180,6 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         daily_limit_hours = None
         used_hours = 0.0
     else:
-        # remaining_time gives remaining; limit - remaining = used
         if rem_secs is None:
             daily_limit_hours = float(role_hours)
             used_hours = 0.0
@@ -246,7 +209,6 @@ async def theme_command(update: Update, context: ContextTypes.DEFAULT_TYPE, them
         return
 
     user_themes[user.id] = theme_name
-    theme = get_theme(user.id)
 
     confirm_text = messages.get_reply(
         theme_name,
@@ -269,17 +231,20 @@ async def dark_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # =========================
-# /record flow (step 1: parse + probe)
+# /record and /stop
 # =========================
 
 async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /record <link> <duration_or_timestamp> [filename]
+    /record <link> [filename]
 
     Example:
-        /record http://example.com/stream.m3u8 3600 my_show
-        /record http://example.com/stream.m3u8 01:00:00 my_show
-        /record http://example.com/stream.m3u8 00:00:00 my_show  (unlimited)
+        /record http://example.com/stream.m3u8 my_show
+
+    This starts a continuous 600MB-chunked recording:
+      - Each chunk (~<=600 MB) is uploaded to Telegram
+      - After upload, the file is deleted from disk
+      - Recording + upload run in parallel
     """
     user = update.effective_user
     msg = update.effective_message
@@ -290,32 +255,24 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     role = get_role(user.id)
 
     args = context.args
-    if len(args) < 2:
+    if len(args) < 1:
         await msg.reply_text(
-            theme.error("Usage: /record <link> <duration_or_timestamp> [filename]")
+            theme.error("Usage: /record <link> [filename]")
         )
         return
 
     link = args[0]
-    duration_str = args[1]
-    filename = None
-    if len(args) >= 3:
-        filename = args[2].strip()
+    if len(args) >= 2:
+        filename_base = args[1].strip()
+    else:
+        filename_base = f"rec_{user.id}"
 
-    if not filename:
-        # Simple fallback base name
-        filename = f"rec_{user.id}"
-
-    duration_seconds = parse_duration_str(duration_str)
-    # None => unlimited; for limit check we'll treat as 0 pre-estimate
-    intended_duration = duration_seconds or 0
-
-    # Check limits & concurrency
+    # Limit check: we don't know total duration, so use 0 seconds
     limit_result = check_limits(
         user_id=user.id,
         role=role,
         trial_requested=False,
-        duration_seconds=intended_duration,
+        duration_seconds=0,
     )
 
     if not limit_result.allowed:
@@ -327,7 +284,6 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 limit_hours=LIMITS.get(role, {}).get("hours", "∞"),
                 used_hours="N/A",
             )
-            # override with savage line:
             text = "Apne Aukat mai raha karo 😒\n\n" + text
             await msg.reply_text(text)
             return
@@ -338,12 +294,12 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         elif code == "daily_limit":
             limit_hours = LIMITS.get(role, {}).get("hours", "∞")
-            used_secs_remaining = limit_result.remaining_seconds or 0
+            remaining = limit_result.remaining_seconds or 0
             if limit_hours == "∞" or limit_hours is None:
                 used_hours = "N/A"
             else:
                 total_secs = limit_hours * 3600
-                used_secs = max(0, total_secs - used_secs_remaining)
+                used_secs = max(0, total_secs - remaining)
                 used_hours = f"{used_secs / 3600:.2f}"
             text = messages.get_reply(
                 get_theme_name(user.id),
@@ -359,305 +315,144 @@ async def record_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-    # If we reach here, allowed (owner always allowed by hours check)
-    await msg.reply_text(theme.info("Probing stream for qualities & audio tracks..."))
-
-    probe = await probe_stream(link)
-
-    # Build qualities list for buttons
-    if probe.qualities:
-        qualities_list = [
-            {"id": q.id, "label": q.label, "stream_index": q.stream_index}
-            for q in probe.qualities
-        ]
-    else:
-        qualities_list = [{"id": "auto", "label": "AUTO", "stream_index": None}]
-
-    # Build audio list
-    if probe.audios:
-        audio_list = [
-            {"id": a.id, "label": a.label, "stream_index": a.stream_index}
-            for a in probe.audios
-        ]
-    else:
-        audio_list = [{"id": "und", "label": "Default", "stream_index": None}]
-
-    # Store pending recording params in user_data
-    context.user_data["pending_record"] = {
-        "link": link,
-        "duration_seconds": duration_seconds,
-        "filename_base": filename,
-        "qualities": qualities_list,
-        "audios": audio_list,
-        "role": role,
-    }
-
-    kb = generate_quality_buttons(qualities_list)
-    await msg.reply_text("Select quality:", reply_markup=kb)
-
-
-# =========================
-# Callback handlers for quality/audio selection
-# =========================
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Single entry for all callback queries:
-      - quality_*
-      - audio_*
-      - stop_*
-      - info_*
-    """
-    query = update.callback_query
-    if not query:
-        return
-
-    await query.answer()
-    data = query.data or ""
-    user = query.from_user
-    theme = get_theme(user.id)
-
-    # Quality selection
-    if data.startswith("quality_"):
-        qid = parse_quality_callback(data)
-        pending = context.user_data.get("pending_record")
-        if not pending:
-            await query.edit_message_text(theme.error("No pending recording session."))
-            return
-
-        qualities = pending.get("qualities", [])
-        selected_q = None
-        for q in qualities:
-            if str(q.get("id")) == str(qid):
-                selected_q = q
-                break
-
-        if not selected_q:
-            await query.edit_message_text(theme.error("Selected quality not found."))
-            return
-
-        pending["selected_quality"] = selected_q
-        context.user_data["pending_record"] = pending
-
-        # Ask for audio
-        audios = pending.get("audios", [])
-        kb = generate_audio_buttons(audios)
-        await query.edit_message_text("Select audio track:", reply_markup=kb)
-        return
-
-    # Audio selection
-    if data.startswith("audio_"):
-        aid = parse_audio_callback(data)
-        pending = context.user_data.get("pending_record")
-        if not pending:
-            await query.edit_message_text(theme.error("No pending recording session."))
-            return
-
-        audios = pending.get("audios", [])
-        selected_a = None
-        for a in audios:
-            if str(a.get("id")) == str(aid):
-                selected_a = a
-                break
-
-        if not selected_a:
-            await query.edit_message_text(theme.error("Selected audio not found."))
-            return
-
-        pending["selected_audio"] = selected_a
-        context.user_data["pending_record"] = pending
-
-        # Now start recording
-        await start_recording_from_pending(query, context, pending)
-        # Remove pending after starting
-        context.user_data.pop("pending_record", None)
-        return
-
-    # Stop / Info
-    if data.startswith("stop_"):
-        target_uid_str = parse_stop_info_callback(data)
-        try:
-            target_uid = int(target_uid_str)
-        except ValueError:
-            target_uid = user.id
-
-        # Only owner, admins or same user can stop
-        user_role = get_role(user.id)
-        if user.id != target_uid and user_role not in ("owner", "admin"):
-            await query.edit_message_text(theme.error("You are not allowed to stop this session."))
-            return
-
-        await stop_recording(target_uid)
-        await query.edit_message_text(theme.info("Stop requested. Recording will terminate shortly."))
-        return
-
-    if data.startswith("info_"):
-        target_uid_str = parse_stop_info_callback(data)
-        try:
-            target_uid = int(target_uid_str)
-        except ValueError:
-            target_uid = user.id
-
-        rec = active_recordings.get(target_uid)
-        if not rec:
-            await query.edit_message_text(theme.info("No active recording for this user."))
-            return
-
-        elapsed = rec.get("elapsed", 0.0)
-        bitrate = rec.get("bitrate_mbps", 0.0)
-        filename_base = rec.get("filename_base", "unknown")
-        link = rec.get("link", "n/a")
-
-        text = (
-            f"🎥 Recording info\n"
-            f"User: {target_uid}\n"
-            f"Base name: {filename_base}\n"
-            f"Source: {link}\n"
-            f"Elapsed: {human_duration(elapsed)}\n"
-            f"Bitrate: {bitrate:.2f} Mbps\n"
-        )
-        await query.edit_message_text(text)
-        return
-
-
-async def start_recording_from_pending(query, context: ContextTypes.DEFAULT_TYPE, pending: Dict[str, Any]) -> None:
-    """
-    Helper to start recording after quality + audio selection.
-    """
-    user = query.from_user
-    theme = get_theme(user.id)
-
-    link = pending["link"]
-    duration_seconds = pending["duration_seconds"]
-    filename_base = pending["filename_base"]
-    role = pending["role"]
-    selected_q = pending.get("selected_quality")
-    selected_a = pending.get("selected_audio")
-
-    # Now that user committed, mark usage & concurrency
-    intended_duration = duration_seconds or 0
+    # Mark concurrency in usage (duration unknown, so 0 here)
     add_usage(
         user_id=user.id,
         role=role,
-        duration_seconds=intended_duration,
+        duration_seconds=0,
         trial=False,
     )
 
-    # Initial active recording info
+    # Track active recording
     active_recordings[user.id] = {
         "link": link,
         "filename_base": filename_base,
-        "quality_label": selected_q.get("label") if isinstance(selected_q, dict) else str(selected_q),
-        "audio_label": selected_a.get("label") if isinstance(selected_a, dict) else str(selected_a),
-        "start_time": None,
-        "elapsed": 0.0,
-        "bitrate_mbps": 0.0,
-        "percent": None,
-        "chat_id": query.message.chat_id,
-        "message_id": None,  # we'll set after sending
+        "start_time": datetime.utcnow(),
+        "chat_id": msg.chat_id,
         "theme_name": get_theme_name(user.id),
-        "role": role,
     }
 
-    # Send recording start message
-    start_text = theme.recording_start(
+    # Inform user
+    info_text = theme.recording_start(
         link=link,
-        quality=active_recordings[user.id]["quality_label"],
-        audio=active_recordings[user.id]["audio_label"],
+        quality="chunked",
+        audio="auto",
     )
-    kb = generate_stop_info_buttons(user.id)
-    sent = await query.edit_message_text(start_text, reply_markup=kb)
+    await msg.reply_text(info_text)
 
-    # Store message id for progress updates
-    active_recordings[user.id]["message_id"] = sent.message_id
+    out_dir = Path("bot/downloads") / str(user.id)
 
-    # Prepare callback wrappers
-    async def progress_cb(u_id, filename_base, elapsed_sec, bytes_written, bitrate_mbps, percent):
-        rec = active_recordings.get(u_id)
-        if not rec:
-            return
-        rec["elapsed"] = elapsed_sec
-        rec["bitrate_mbps"] = bitrate_mbps
-        rec["percent"] = percent
-        active_recordings[u_id] = rec
-
-        # Prepare progress display
-        tname = rec.get("theme_name", get_theme_name(u_id))
-        t = ui.get_theme(tname)
-        # Use download_progress style for recording phase
-        text = t.download_progress(
-            filename=filename_base,
-            percent=percent or 0.0,
-            speed_mbps=bitrate_mbps or 0.0,
-        )
-
-        chat_id = rec.get("chat_id")
-        msg_id = rec.get("message_id")
-        if chat_id and msg_id:
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    text=text,
-                    reply_markup=generate_stop_info_buttons(u_id),
-                )
-            except Exception as e:
-                logger.warning("Failed to update progress message: %s", e)
-
-    async def done_cb(u_id, filename_base, out_dir, parts, elapsed_sec):
-        # Remove concurrency
-        remove_concurrent(u_id)
-        rec = active_recordings.pop(u_id, None)
-
-        # Upload to MEGA
-        from .utils.uploader import upload_parts_to_mega
-
-        async def up_progress_cb(user_id, base_name, part_idx, total_parts, filename, stage, percent):
-            # Optionally update message with upload stage
-            r = active_recordings.get(user_id) or rec
-            if not r:
-                return
-            chat_id = r.get("chat_id")
-            msg_id = r.get("message_id")
-            tname = r.get("theme_name", get_theme_name(user_id))
-            t = ui.get_theme(tname)
-
-            bar_text = t.upload_progress(
-                filename=filename,
-                percent=percent,
-                speed_mbps=None,
+    async def progress_cb(chunk_info, stage: str):
+        # Here you could edit a status message, or log to a channel.
+        # For now, just log to stderr.
+        if stage == "start":
+            logger.info(
+                "User %s chunk %s started (%s)",
+                chunk_info.user_id,
+                chunk_info.part_index,
+                chunk_info.path,
             )
-            extra = f"\nPart {part_idx}/{total_parts} | Stage: {stage}"
+        else:
+            logger.info(
+                "User %s chunk %s uploaded & deleted",
+                chunk_info.user_id,
+                chunk_info.part_index,
+            )
 
-            if chat_id and msg_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=msg_id,
-                        text=bar_text + extra,
-                    )
-                except Exception as e:
-                    logger.warning("Failed to update upload message: %s", e)
+    async def run_pipeline_and_cleanup():
+        try:
+            await start_chunked_pipeline(
+                user_id=user.id,
+                chat_id=msg.chat_id,
+                bot=context.bot,
+                link=link,
+                base_name=filename_base,
+                out_dir=out_dir,
+                progress_cb=progress_cb,
+                max_parts=None,
+            )
+        finally:
+            # Cleanup
+            remove_concurrent(user.id)
+            rec = active_recordings.pop(user.id, None)
 
-        async def up_error_cb(user_id, base_name, message_text):
-            r = active_recordings.get(user_id) or rec
-            tname = (r or {}).get("theme_name", get_theme_name(user_id))
+            tname = (rec or {}).get("theme_name", get_theme_name(user.id))
             t = ui.get_theme(tname)
-            text = t.error(f"MEGA upload error: {message_text}")
-            chat_id = (r or {}).get("chat_id")
-            if chat_id:
-                try:
-                    await context.bot.send_message(chat_id=chat_id, text=text)
-                except Exception as e:
-                    logger.warning("Failed to send MEGA error message: %s", e)
+            end_text = t.info(f"Recording session for {filename_base} finished.")
 
-        upload_result = await upload_parts_to_mega(
-            user_id=u_id,
-            base_name=filename_base,
-            parts=parts,
-            remote_folder=None,
-            progress_callback=up_progress_cb,
-            error_callback=up_error_cb,
-        )
+            # Notify user
+            try:
+                await context.bot.send_message(chat_id=msg.chat_id, text=end_text)
+            except Exception as e:
+                logger.warning("Failed to send end message: %s", e)
 
-        upload_result = await upload_parts_to_mega(...)
+            # Notify log channel (optional)
+            try:
+                await context.bot.send_message(
+                    chat_id=LOG_CHANNEL_ID,
+                    text=f"[SESSION_END] user={user.id} base={filename_base}",
+                )
+            except Exception:
+                pass
+
+    # Fire and forget
+    context.application.create_task(run_pipeline_and_cleanup())
+
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /stop – request stop for current user's recording.
+    """
+    user = update.effective_user
+    msg = update.effective_message
+    if not user or not msg:
+        return
+
+    theme = get_theme(user.id)
+    if user.id not in active_recordings:
+        await msg.reply_text(theme.info("No active recording to stop."))
+        return
+
+    request_stop(user.id)
+    await msg.reply_text(theme.info("Stop requested. Recording will finish after current chunk."))
+
+
+# =========================
+# App setup / entry
+# =========================
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    if not BOT_TOKEN or BOT_TOKEN == "CHANGE_ME_TELEGRAM_BOT_TOKEN":
+        raise RuntimeError("BOT_TOKEN is not set. Configure it in environment or config.py")
+
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Core commands
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("record", record_command))
+    application.add_handler(CommandHandler("stop", stop_command))
+    application.add_handler(CommandHandler("hot", hot_command))
+    application.add_handler(CommandHandler("cold", cold_command))
+    application.add_handler(CommandHandler("dark", dark_command))
+
+    # JobQueue: daily reset
+    tz = ZoneInfo(DAILY_RESET_TZ)
+    reset_time = dt_time(
+        hour=DAILY_RESET_HOUR,
+        minute=DAILY_RESET_MINUTE,
+        tzinfo=tz,
+    )
+    application.job_queue.run_daily(daily_reset_job, time=reset_time)
+
+    logger.info("Starting bot (version %s)...", BOT_VERSION)
+    application.run_polling(close_loop=False)
+
+
+if __name__ == "__main__":
+    main()
